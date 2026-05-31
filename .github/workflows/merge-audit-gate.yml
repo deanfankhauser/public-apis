@@ -1,0 +1,55 @@
+name: merge-audit-gate
+# Server-side half of the Merge audit gate (dean-knowledge _shared/agent-operating-rhythm.md).
+# High-risk PRs (money / data & schema / auth / prod & irreversible ops) cannot merge
+# without an `audit:pass` label. New commits strip the label, keeping it SHA-bound.
+# Low-risk PRs pass automatically. Pairs with the local hook ~/.claude/hooks/merge-audit-gate.sh.
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  merge-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Strip audit:pass on new commits (keep the verdict SHA-bound)
+        if: github.event.action == 'synchronize'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh pr edit "${{ github.event.pull_request.number }}" \
+            --repo "${{ github.repository }}" --remove-label "audit:pass" 2>/dev/null || true
+          echo "New commits pushed -> audit:pass removed; re-audit required."
+
+      - name: Evaluate gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          files="$(gh pr view "$PR" --repo "$REPO" --json files -q '.files[].path')"
+          # Two-tier: STRUCT paths always gate; KW keywords gate only on non-doc files
+          # (so a docs file merely mentioning "stripe"/"auth" is not gated).
+          STRUCT='(^|/)migrations?/|\.sql$|(^|/)supabase/|(^|/)\.github/workflows/|(^|/)Dockerfile|vercel\.json$|fly\.toml$|(^|/)Caddyfile|wrangler'
+          KW='stripe|billing|invoice|payment|payout|commercial|webhook|auth|[._-]rls|polic(y|ies)|permission|session|middleware|login'
+          nonmd="$(printf '%s\n' "$files" | grep -ivE '\.(md|mdx|markdown|txt)$' || true)"
+          hits="$(printf '%s\n%s\n' \
+            "$(printf '%s\n' "$files" | grep -iE "$STRUCT" || true)" \
+            "$(printf '%s\n' "$nonmd"  | grep -iE "$KW" || true)" \
+            | grep -v '^$' | sort -u || true)"
+          if [ -z "$hits" ]; then
+            echo "Low-risk diff - merge-audit gate not required. PASS"
+            exit 0
+          fi
+          echo "High-risk files detected:"; printf '%s\n' "$hits" | sed 's/^/  - /'
+          labels="$(gh pr view "$PR" --repo "$REPO" --json labels -q '.labels[].name')"
+          if printf '%s\n' "$labels" | grep -qx "audit:pass"; then
+            echo "audit:pass present - independent pre-merge audit recorded. PASS"
+            exit 0
+          fi
+          echo "::error::High-risk PR missing the 'audit:pass' label. Run an independent adversarial audit (dean-knowledge _shared/agent-operating-rhythm.md -> Merge audit gate); on a clean result apply it:  gh pr edit $PR --repo $REPO --add-label audit:pass"
+          exit 1
